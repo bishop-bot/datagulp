@@ -64,12 +64,14 @@ impl Transformer {
     }
 
     /// Parse a numeric value with flexible decimal handling
+    #[allow(dead_code)]
     pub fn parse_number<T: FromStr>(s: &str) -> Option<T> {
         let cleaned = s.trim().replace(",", "").replace("$", "");
         cleaned.parse().ok()
     }
 
     /// Clean a string value (remove quotes, whitespace)
+    #[allow(dead_code)]
     pub fn clean_string(s: &str) -> String {
         s.trim().trim_matches('"').to_string()
     }
