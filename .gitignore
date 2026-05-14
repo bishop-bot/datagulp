@@ -1,1 +1,22 @@
 /target
+
+# Remove this macro if you want to check in your Cargo.lock
+# (Recommended for executables, but NOT for libraries)
+# Cargo.lock
+
+# Backup files from editors (optional)
+**/*.rs.bk
+
+## File system
+.DS_Store
+desktop.ini
+
+# Environment variables
+.env
+
+# Editor
+.idea/
+.vim/
+.vscode/
+*.swp
+*.swo
