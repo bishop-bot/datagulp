@@ -27,6 +27,7 @@ rayon = "1.10"
 
 # Progress tracking
 indicatif = { version = "0.17", features = ["tokio"] }
+sysinfo = "0.32"
 
 [dev-dependencies]
 tempfile = "3"

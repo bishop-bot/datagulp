@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use csv::{ReaderBuilder, WriterBuilder};
 use rayon::prelude::*;
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -57,6 +57,17 @@ fn write_batch<W: Write>(writer: &mut csv::Writer<W>, results: Vec<String>) -> u
     count
 }
 
+/// Count total lines in a file (for progress bar total)
+fn count_lines(path: &PathBuf) -> Option<u64> {
+    let file = File::open(path).ok()?;
+    let count = std::io::BufReader::new(file)
+        .lines()
+        .count()
+        .try_into()
+        .ok()?;
+    Some(count)
+}
+
 /// Process the input CSV file
 pub fn process_file(args: &Args) -> Result<()> {
     // Setup
@@ -76,6 +87,11 @@ pub fn process_file(args: &Args) -> Result<()> {
         Box::new(BufWriter::new(File::create(&output_path)?))
     };
 
+    // Count total lines for progress bar (skip header row if present)
+    let total_rows = count_lines(&args.input).map(|c| {
+        if args.skip_rows > 0 { c.saturating_sub(args.skip_rows as u64) } else { c }
+    });
+
     let mut reader = ReaderBuilder::new()
         .delimiter(delimiter)
         .has_headers(false)
@@ -85,7 +101,7 @@ pub fn process_file(args: &Args) -> Result<()> {
         .delimiter(delimiter)
         .from_writer(output_file);
 
-    let stats = Arc::new(Stats::new());
+    let stats = Arc::new(Stats::new(total_rows));
     let cancelled = Arc::new(AtomicBool::new(false));
 
     // Handle SIGINT for graceful shutdown
@@ -116,7 +132,7 @@ pub fn process_file(args: &Args) -> Result<()> {
             Ok(record) => {
                 let row = record.iter().collect::<Vec<_>>().join(",");
                 batch.push(row);
-                stats.rows_read.fetch_add(1, Ordering::Relaxed);
+                stats.inc_read(1);
 
                 if batch.len() >= args.batch_size {
                     let results = process_batch(
@@ -128,15 +144,11 @@ pub fn process_file(args: &Args) -> Result<()> {
                     );
 
                     let written = write_batch(&mut writer, results);
-                    stats.rows_written.fetch_add(written, Ordering::Relaxed);
-                }
-
-                if stats.rows_read.load(Ordering::Relaxed) % args.progress_every == 0 {
-                    stats.print(false);
+                    stats.inc_written(written);
                 }
             }
             Err(_e) => {
-                stats.rows_failed.fetch_add(1, Ordering::Relaxed);
+                stats.inc_failed(1);
             }
         }
 
@@ -156,10 +168,11 @@ pub fn process_file(args: &Args) -> Result<()> {
         );
 
         let written = write_batch(&mut writer, results);
-        stats.rows_written.fetch_add(written, Ordering::Relaxed);
+        stats.inc_written(written);
     }
 
     writer.flush()?;
+    stats.finish();
     stats.print_summary();
 
     Ok(())
