@@ -18,11 +18,7 @@ pub fn process_file(args: &Args) -> Result<()> {
     let input_file = File::open(&args.input)
         .with_context(|| format!("Failed to open input file: {}", args.input.display()))?;
 
-    let output_path = args
-        .output
-        .as_ref()
-        .map(|p| p.clone())
-        .unwrap_or_else(|| PathBuf::from("-"));
+    let output_path = args.output.clone().unwrap_or_else(|| PathBuf::from("-"));
 
     let mut output_file: Box<dyn Write> = if output_path.as_os_str() == "-" {
         Box::new(std::io::stdout())
@@ -168,7 +164,7 @@ fn process_line_raw(
             if i == date_col {
                 result.extend_from_slice(formatted.as_bytes());
             } else if i != time_col {
-                result.extend_from_slice(*col);
+                result.extend_from_slice(col);
                 result.push(b',');
             }
         }

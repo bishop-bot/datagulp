@@ -56,7 +56,7 @@ impl Transformer {
                 let utc_dt = Utc.from_utc_datetime(dt);
                 utc_dt.timestamp().to_string() + "." + &dt.format("%6f").to_string()
             }
-            "questdb" | _ => {
+            _ => {
                 // QuestDB format: yyyy-MM-dd HH:mm:ss.SSS
                 dt.format("%Y-%m-%d %H:%M:%S%.3f").to_string()
             }
