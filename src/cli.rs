@@ -62,4 +62,9 @@ pub struct Args {
     /// Print progress every N rows
     #[arg(long, default_value = "50000")]
     pub progress_every: usize,
+
+
+    /// Use memory-mapped file processing (faster for large files)
+    #[arg(long)]
+    pub mmap: bool,
 }

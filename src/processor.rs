@@ -75,11 +75,7 @@ pub fn process_file(args: &Args) -> Result<()> {
         .with_context(|| format!("Failed to open input file: {}", args.input.display()))?;
 
     let delimiter = args.delimiter.as_bytes().first().copied().unwrap_or(b',');
-    let output_path = args
-        .output
-        .as_ref()
-        .map(|p| p.clone())
-        .unwrap_or_else(|| PathBuf::from("-"));
+    let output_path = args.output.clone().unwrap_or_else(|| PathBuf::from("-"));
 
     let output_file: Box<dyn Write> = if output_path.as_os_str() == "-" {
         Box::new(std::io::stdout())
