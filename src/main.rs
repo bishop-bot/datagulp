@@ -4,6 +4,7 @@
 
 mod cli;
 mod processor;
+mod processor_mmap;
 mod stats;
 mod transformer;
 
@@ -31,7 +32,14 @@ fn main() {
     }
 
     // Run processor
-    if let Err(e) = processor::process_file(&args) {
+    let result = if args.mmap {
+        processor_mmap::process_file(&args)
+    } else {
+        processor::process_file(&args)
+    };
+
+
+    if let Err(e) = result {
         eprintln!("Error: {}", e);
         std::process::exit(1);
     }
