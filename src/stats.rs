@@ -102,8 +102,9 @@ impl Stats {
     pub fn print_summary(&self) {
         let elapsed = self.start_time.elapsed();
         let total = self.rows_read.load(Ordering::Relaxed);
-        let rate = if elapsed.as_secs() > 0 {
-            total as f64 / elapsed.as_secs_f64()
+        let elapsed_secs = elapsed.as_secs_f64();
+        let rate = if elapsed_secs > 0.0 {
+            total as f64 / elapsed_secs
         } else {
             0.0
         };
