@@ -20,23 +20,32 @@ cargo build --release
 
 ```bash
 # Standard mode (batch processing)
-datagulp -i input.csv -o output.csv --combine-datetime
+datagulp -i input.csv -o output.csv --symbol ES --mic XCME --combine-datetime
 
 # High-performance mode for large files (10+ GB)
-datagulp -i input.csv -o output.csv --combine-datetime --mmap
+datagulp -i input.csv -o output.csv --symbol ES --mic XCME --combine-datetime --mmap
 
 # Custom date/time column indices
-datagulp -i input.csv -o output.csv --combine-datetime -d 2 -t 3
+datagulp -i input.csv -o output.csv --symbol ES --mic XCME --combine-datetime -d 2 -t 3
 
 # Process with different timestamp formats
-datagulp -i input.csv -o output.csv --combine-datetime --timestamp-format iso8601
-datagulp -i input.csv -o output.csv --combine-datetime --timestamp-format unix_epoch
+datagulp -i input.csv -o output.csv --symbol ES --mic XCME --combine-datetime --timestamp-format iso8601
+datagulp -i input.csv -o output.csv --symbol ES --mic XCME --combine-datetime --timestamp-format unix_epoch
 
 # Process only first N rows
-datagulp -i input.csv -o output.csv --limit 100000
+datagulp -i input.csv -o output.csv --symbol ES --mic XCME --limit 100000
 
 # Adjust batch size and workers
-datagulp -i input.csv -o output.csv --batch-size 50000 -w 8
+datagulp -i input.csv -o output.csv --symbol ES --mic XCME --batch-size 50000 -w 8
+```
+
+## Output Format
+
+The output CSV includes `symbol` and `mic` as the first two columns, followed by the transformed data:
+
+```
+symbol,mic,ts,price,size
+ES,XCME,2026-01-01 17:00:00.000,6902.00,4
 ```
 
 ## Options
@@ -45,6 +54,8 @@ datagulp -i input.csv -o output.csv --batch-size 50000 -w 8
 |------|-------------|---------|
 | `-i, --input` | Input CSV file (use `-` for stdin) | Required |
 | `-o, --output` | Output CSV file (use `-` for stdout) | stdout |
+| `--symbol` | Ticker symbol (added as first column in output) | Required |
+| `--mic` | Market Identifier Code - ISO 10383 | Required |
 | `-D, --delimiter` | CSV delimiter character | `,` |
 | `-d, --date-col` | Date column index (0-based) | `0` |
 | `-t, --time-col` | Time column index (0-based) | `1` |

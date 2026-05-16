@@ -59,10 +59,13 @@ pub struct Args {
     #[arg(short, long)]
     pub verbose: bool,
 
-    /// Print progress every N rows
-    #[arg(long, default_value = "50000")]
-    pub progress_every: usize,
+    /// Ticker symbol (added as first column in output)
+    #[arg(long)]
+    pub symbol: String,
 
+    /// Market Identifier Code - ISO 10383 (added as second column in output)
+    #[arg(long)]
+    pub mic: String,
 
     /// Use memory-mapped file processing (faster for large files)
     #[arg(long)]

@@ -28,6 +28,8 @@ fn main() {
         eprintln!("datagulp v{} starting...", env!("CARGO_PKG_VERSION"));
         eprintln!("Input: {:?}", args.input);
         eprintln!("Output: {:?}", args.output);
+        eprintln!("Symbol: {}", args.symbol);
+        eprintln!("MIC: {}", args.mic);
         eprintln!("Batch size: {}", args.batch_size);
     }
 

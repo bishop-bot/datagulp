@@ -15,43 +15,54 @@ use crate::cli::Args;
 
 /// Process a single batch of rows
 fn process_batch(
-    batch: Vec<String>,
+    batch: Vec<Vec<String>>,
     date_col: usize,
     time_col: usize,
     combine_datetime: bool,
     timestamp_format: &str,
-) -> Vec<String> {
+    symbol: &str,
+    mic: &str,
+) -> Vec<Vec<String>> {
     batch
-        .par_iter()
-        .map(|row| {
-            let cols: Vec<&str> = row.split(',').collect();
+        .into_par_iter()
+        .map(|cols| {
+            let mut output = Vec::with_capacity(cols.len() + 2);
+            output.push(symbol.to_string());
+            output.push(mic.to_string());
 
             if combine_datetime && date_col < cols.len() && time_col < cols.len() {
-                let date = cols[date_col];
-                let time = cols[time_col];
+                let date = &cols[date_col];
+                let time = &cols[time_col];
 
                 // Parse and format timestamp
                 let timestamp = Transformer::parse_datetime(date, time);
                 if let Some(ts) = timestamp {
                     let formatted = Transformer::format_timestamp(&ts, timestamp_format);
-                    // Replace date+time columns with formatted timestamp
-                    let mut new_cols: Vec<&str> = cols.to_vec();
-                    new_cols[date_col] = &formatted;
-                    new_cols.remove(time_col); // Remove time column
-                    return new_cols.join(",");
+                    output.push(formatted);
+                } else {
+                    output.push(cols[date_col].clone());
                 }
+                // Add remaining columns except date and time
+                for (i, col) in cols.iter().enumerate() {
+                    if i != date_col && i != time_col {
+                        output.push(col.clone());
+                    }
+                }
+            } else {
+                // No datetime transformation - add all columns as-is
+                output.extend(cols);
             }
 
-            row.to_string()
+            output
         })
         .collect()
 }
 
 /// Write processed rows to the output writer
-fn write_batch<W: Write>(writer: &mut csv::Writer<W>, results: Vec<String>) -> usize {
+fn write_batch<W: Write>(writer: &mut csv::Writer<W>, results: Vec<Vec<String>>) -> usize {
     let mut count = 0;
-    for result in results {
-        writer.write_record(result.split(',')).ok();
+    for fields in results {
+        writer.write_record(&fields).ok();
         count += 1;
     }
     count
@@ -110,7 +121,7 @@ pub fn process_file(args: &Args) -> Result<()> {
     }
 
     // Process in batches
-    let mut batch: Vec<String> = Vec::with_capacity(args.batch_size);
+    let mut batch: Vec<Vec<String>> = Vec::with_capacity(args.batch_size);
     let mut processed = 0;
 
     for result in reader.records() {
@@ -126,8 +137,9 @@ pub fn process_file(args: &Args) -> Result<()> {
 
         match result {
             Ok(record) => {
-                let row = record.iter().collect::<Vec<_>>().join(",");
-                batch.push(row);
+                // Keep fields as proper Vec<String> to preserve CSV structure
+                let fields: Vec<String> = record.iter().map(|s| s.to_string()).collect();
+                batch.push(fields);
                 stats.inc_read(1);
 
                 if batch.len() >= args.batch_size {
@@ -137,6 +149,8 @@ pub fn process_file(args: &Args) -> Result<()> {
                         args.time_col,
                         args.combine_datetime,
                         &args.timestamp_format,
+                        &args.symbol,
+                        &args.mic,
                     );
 
                     let written = write_batch(&mut writer, results);
@@ -161,6 +175,8 @@ pub fn process_file(args: &Args) -> Result<()> {
             args.time_col,
             args.combine_datetime,
             &args.timestamp_format,
+            &args.symbol,
+            &args.mic,
         );
 
         let written = write_batch(&mut writer, results);
