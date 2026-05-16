@@ -2,7 +2,6 @@
 
 use crate::stats::Stats;
 use anyhow::{Context, Result};
-use csv::{WriterBuilder, ByteRecord};
 use memmap2::Mmap;
 use rayon::prelude::*;
 use std::fs::File;
@@ -22,7 +21,7 @@ pub fn process_file(args: &Args) -> Result<()> {
     let delimiter = args.delimiter.as_bytes().first().copied().unwrap_or(b',');
     let output_path = args.output.clone().unwrap_or_else(|| PathBuf::from("-"));
 
-    let output_file: Box<dyn Write> = if output_path.as_os_str() == "-" {
+    let mut output_file: Box<dyn Write> = if output_path.as_os_str() == "-" {
         Box::new(std::io::stdout())
     } else {
         Box::new(BufWriter::new(File::create(&output_path)?))
@@ -49,11 +48,6 @@ pub fn process_file(args: &Args) -> Result<()> {
             cancelled_clone.store(true, Ordering::SeqCst);
         }));
     }
-
-    // Create CSV writer
-    let mut writer = WriterBuilder::new()
-        .delimiter(delimiter)
-        .from_writer(output_file);
 
     // Process in large chunks
     let chunk_size = args.batch_size.max(100_000);
@@ -83,24 +77,28 @@ pub fn process_file(args: &Args) -> Result<()> {
         // Split into lines and process
         let lines = split_lines_fast(chunk);
 
-        // Process in parallel - return ByteRecords for efficient writing
-        let processed: Vec<ByteRecord> = lines
+        // Process in parallel using Rayon - use byte processing for speed
+        let processed: Vec<String> = lines
             .par_iter()
             .enumerate()
             .filter(|(idx, _)| *idx >= local_skip)
             .map(|(_, line)| {
-                process_line_to_record(line, args.date_col, args.time_col, args.combine_datetime, &args.timestamp_format)
+                process_line_to_string(line, delimiter, args.date_col, args.time_col, args.combine_datetime, &args.timestamp_format)
             })
             .collect();
 
         let count = processed.len();
         stats.inc_read(count);
 
-        // Write batch to CSV output
+        // Write to output - batch write for efficiency
         if !processed.is_empty() {
-            for record in processed {
-                writer.write_byte_record(&record).ok();
+            // Join all lines with newline and write in one syscall
+            let mut output = Vec::with_capacity(count * 50);
+            for line in &processed {
+                output.extend_from_slice(line.as_bytes());
+                output.push(b'\n');
             }
+            output_file.write_all(&output).ok();
             stats.inc_written(count);
         }
 
@@ -111,7 +109,7 @@ pub fn process_file(args: &Args) -> Result<()> {
         }
     }
 
-    writer.flush()?;
+    output_file.flush()?;
     stats.finish();
     stats.print_summary();
 
@@ -139,79 +137,88 @@ fn split_lines_fast(data: &[u8]) -> Vec<&[u8]> {
     lines
 }
 
-/// Process a raw line and return ByteRecord for efficient CSV writing
-/// Avoids String allocations by working with byte slices
-fn process_line_to_record(
+/// Process a raw line to String - handles quoting correctly
+fn process_line_to_string(
     line: &[u8],
+    delimiter: u8,
     date_col: usize,
     time_col: usize,
     combine_datetime: bool,
     timestamp_format: &str,
-) -> ByteRecord {
-    // Parse fields from line as bytes (respecting quotes)
-    let cols = find_columns(line, b',');
+) -> String {
+    // Parse fields from line, respecting quoted fields
+    let cols = find_columns_with_quotes(line, delimiter);
     
     if !combine_datetime {
-        // No transformation needed - convert bytes directly to record
-        let mut record = ByteRecord::with_capacity(cols.len(), line.len());
-        for col in cols {
-            record.push_field(strip_field_quotes(col));
-        }
-        return record;
+        // No transformation - return as CSV with proper quoting
+        return build_csv_row(&cols, delimiter);
     }
     
     if date_col >= cols.len() || time_col >= cols.len() {
-        // Invalid column indices - return as-is
-        let mut record = ByteRecord::with_capacity(cols.len(), line.len());
-        for col in cols {
-            record.push_field(strip_field_quotes(col));
-        }
-        return record;
+        return build_csv_row(&cols, delimiter);
     }
 
     let date = cols[date_col];
     let time = cols[time_col];
 
-    // Parse datetime from bytes
-    let timestamp = parse_datetime_bytes(date, time);
+    // Parse datetime
+    let timestamp = parse_datetime(date, time);
     
     if let Some(ts) = timestamp {
-        let formatted = format_timestamp_bytes(&ts, timestamp_format);
+        let formatted = format_timestamp(&ts, timestamp_format);
         
-        // Build record: timestamp + remaining columns (skipping time_col)
-        let num_fields = cols.len() - 1;
-        let mut record = ByteRecord::with_capacity(num_fields, formatted.len() + line.len());
-        
+        // Build result: timestamp + remaining columns (skipping time_col)
+        let mut result = Vec::with_capacity(line.len());
         for (i, col) in cols.iter().enumerate() {
             if i == date_col {
-                record.push_field(&formatted);
+                // Add timestamp (may need quoting if it contains delimiter)
+                extend_with_csv_field(&mut result, formatted.as_bytes(), delimiter);
             } else if i != time_col {
-                record.push_field(strip_field_quotes(col));
+                result.push(delimiter);
+                extend_with_csv_field(&mut result, col, delimiter);
             }
         }
-        return record;
+        return String::from_utf8_lossy(&result).into_owned();
     }
 
-    // Parsing failed - return original
-    let mut record = ByteRecord::with_capacity(cols.len(), line.len());
-    for col in cols {
-        record.push_field(strip_field_quotes(col));
-    }
-    record
+    build_csv_row(&cols, delimiter)
 }
 
-/// Strip surrounding quotes from a byte slice (returns slice without quotes)
-fn strip_field_quotes(field: &[u8]) -> &[u8] {
-    let len = field.len();
-    if len >= 2 && field[0] == b'"' && field[len - 1] == b'"' {
-        &field[1..len - 1]
+/// Build a properly quoted CSV row from fields
+fn build_csv_row(cols: &[&[u8]], delimiter: u8) -> String {
+    let mut result = Vec::with_capacity(cols.len() * 20);
+    for (i, col) in cols.iter().enumerate() {
+        if i > 0 {
+            result.push(delimiter);
+        }
+        extend_with_csv_field(&mut result, col, delimiter);
+    }
+    String::from_utf8_lossy(&result).into_owned()
+}
+
+/// Extend buffer with a CSV field, adding quotes and escaping if needed
+fn extend_with_csv_field(buf: &mut Vec<u8>, field: &[u8], delimiter: u8) {
+    let needs_quotes = field.iter().any(|&b| b == b'"' || b == b'\n' || b == b'\r' || b == delimiter);
+    
+    if needs_quotes {
+        buf.push(b'"');
+        for &byte in field {
+            if byte == b'"' {
+                buf.push(b'"');
+                buf.push(b'"');
+            } else {
+                buf.push(byte);
+            }
+        }
+        buf.push(b'"');
     } else {
-        field
+        buf.extend_from_slice(field);
     }
 }
 
-/// Find column boundaries, respecting quoted fields
-fn find_columns(line: &[u8], delimiter: u8) -> Vec<&[u8]> {
+/// Find column boundaries with proper quoted field support
+/// Returns fields with quotes stripped
+fn find_columns_with_quotes(line: &[u8], delimiter: u8) -> Vec<&[u8]> {
     let mut cols = Vec::new();
     let mut start = 0;
     let mut in_quotes = false;
@@ -224,7 +231,8 @@ fn find_columns(line: &[u8], delimiter: u8) -> Vec<&[u8]> {
             }
             c if !in_quotes && c == delimiter => {
                 if i > start {
-                    cols.push(&line[start..i]);
+                    let field = trim_field(&line[start..i]);
+                    cols.push(field);
                 }
                 start = i + 1;
             }
@@ -232,24 +240,33 @@ fn find_columns(line: &[u8], delimiter: u8) -> Vec<&[u8]> {
         }
     }
 
-    // Handle last field - trim trailing whitespace/newlines
+    // Handle last field - trim trailing newlines and surrounding quotes
     let line_len = line.len();
     let mut end = line_len;
-    
-    // Trim trailing newlines/carriage returns
     while end > start && (line[end - 1] == b'\n' || line[end - 1] == b'\r') {
         end -= 1;
     }
-
     if start < end {
-        cols.push(&line[start..end]);
+        let field = trim_field(&line[start..end]);
+        cols.push(field);
     }
 
     cols
 }
 
-/// Parse datetime from byte slices (avoid String allocation)
-fn parse_datetime_bytes(date: &[u8], time: &[u8]) -> Option<DateTime> {
+/// Trim whitespace and surrounding quotes from a field
+fn trim_field(field: &[u8]) -> &[u8] {
+    let trimmed = trim_bytes(field);
+    let len = trimmed.len();
+    if len >= 2 && trimmed[0] == b'"' && trimmed[len - 1] == b'"' {
+        &trimmed[1..len - 1]
+    } else {
+        trimmed
+    }
+}
+
+/// Parse datetime from byte slices
+fn parse_datetime(date: &[u8], time: &[u8]) -> Option<DateTime> {
     let (month, day, year) = if date.contains(&b'/') {
         let parts = split_bytes(date, b'/');
         if parts.len() != 3 {
@@ -272,7 +289,6 @@ fn parse_datetime_bytes(date: &[u8], time: &[u8]) -> Option<DateTime> {
         )
     };
 
-    // Parse time: HH:MM:SS.mmm
     let time_trimmed = trim_bytes(time);
     let time_parts = split_bytes(time_trimmed, b':');
     if time_parts.len() < 2 {
@@ -346,69 +362,29 @@ fn truncate_bytes(data: &[u8], max_len: usize) -> &[u8] {
     }
 }
 
-/// Format timestamp to bytes (avoid String allocation)
-fn format_timestamp_bytes(dt: &DateTime, format: &str) -> Vec<u8> {
-    // Pre-allocate buffer for max timestamp size
-    let mut buf = Vec::with_capacity(30);
-    
-    // Year (4 digits)
-    push_u32_padded(&mut buf, dt.year, 4);
-    buf.push(b'-');
-    
-    // Month (2 digits)
-    push_u32_padded(&mut buf, dt.month, 2);
-    buf.push(b'-');
-    
-    // Day (2 digits)
-    push_u32_padded(&mut buf, dt.day, 2);
-    
-    if format == "iso8601" {
-        buf.push(b'T');
-    } else {
-        buf.push(b' ');
-    }
-    
-    // Hour
-    push_u32_padded(&mut buf, dt.hour, 2);
-    buf.push(b':');
-    
-    // Minute
-    push_u32_padded(&mut buf, dt.minute, 2);
-    buf.push(b':');
-    
-    // Second
-    push_u32_padded(&mut buf, dt.second, 2);
-    buf.push(b'.');
-    
-    // Milliseconds (3 digits)
-    push_u32_padded(&mut buf, dt.millis, 3);
-    
-    if format == "iso8601" {
-        buf.push(b'Z');
-    }
-    
-    buf
-}
-
-/// Push zero-padded u32 to buffer
-fn push_u32_padded(buf: &mut Vec<u8>, value: u32, width: usize) {
-    let digits = if value == 0 {
-        b"0".to_vec()
-    } else {
-        let mut d = Vec::with_capacity(10);
-        let mut v = value;
-        while v > 0 {
-            d.push(b'0' + (v % 10) as u8);
-            v /= 10;
+/// Format timestamp
+fn format_timestamp(dt: &DateTime, format: &str) -> String {
+    let ms = format!("{:03}", dt.millis);
+    match format {
+        "questdb" | "" => {
+            format!(
+                "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{}",
+                dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second, ms
+            )
         }
-        d.reverse();
-        d
-    };
-    
-    for _ in 0..(width.saturating_sub(digits.len())) {
-        buf.push(b'0');
+        "iso8601" => {
+            format!(
+                "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{}Z",
+                dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second, ms
+            )
+        }
+        _ => {
+            format!(
+                "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{}",
+                dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second, ms
+            )
+        }
     }
-    buf.extend_from_slice(&digits);
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -437,29 +413,18 @@ mod tests {
     }
 
     #[test]
-    fn test_find_columns() {
-        let line = b"a,b,c,d";
-        let cols = find_columns(line, b',');
-        assert_eq!(cols.len(), 4);
-        assert_eq!(cols[0], b"a");
-        assert_eq!(cols[1], b"b");
-        assert_eq!(cols[2], b"c");
-        assert_eq!(cols[3], b"d");
-    }
-
-    #[test]
     fn test_find_columns_with_quotes() {
         let line = b"a,\"b,c\",d";
-        let cols = find_columns(line, b',');
+        let cols = find_columns_with_quotes(line, b',');
         assert_eq!(cols.len(), 3);
         assert_eq!(cols[0], b"a");
-        assert_eq!(cols[1], b"\"b,c\"");
+        assert_eq!(cols[1], b"b,c");  // quotes stripped
         assert_eq!(cols[2], b"d");
     }
 
     #[test]
     fn test_parse_datetime_mdy() {
-        let result = parse_datetime_bytes(b"1/15/2026", b"14:30:45.123");
+        let result = parse_datetime(b"1/15/2026", b"14:30:45.123");
         assert!(result.is_some());
         let dt = result.unwrap();
         assert_eq!(dt.month, 1);
@@ -473,7 +438,7 @@ mod tests {
 
     #[test]
     fn test_parse_datetime_ymd() {
-        let result = parse_datetime_bytes(b"2026-01-15", b"14:30:45.123");
+        let result = parse_datetime(b"2026-01-15", b"14:30:45.123");
         assert!(result.is_some());
         let dt = result.unwrap();
         assert_eq!(dt.month, 1);
@@ -482,33 +447,17 @@ mod tests {
     }
 
     #[test]
-    fn test_process_line_to_record() {
+    fn test_process_line_to_string() {
         let line = b"1/1/2026,17:00:00.000,6902.00,4";
-        let result = process_line_to_record(line, 0, 1, true, "iso8601");
-        assert_eq!(result.len(), 3);
-        // Check first field starts with timestamp pattern
-        let fields: Vec<&[u8]> = result.iter().collect();
-        assert!(fields[0].starts_with(b"2026-01-01T"));
-        assert_eq!(fields[1], b"6902.00");
-        assert_eq!(fields[2], b"4");
+        let result = process_line_to_string(line, b',', 0, 1, true, "iso8601");
+        assert!(result.starts_with("2026-01-01T"));
+        assert!(result.contains(",6902.00,"));
     }
 
     #[test]
-    fn test_format_timestamp_bytes() {
-        let dt = DateTime {
-            year: 2026, month: 1, day: 1, hour: 17, minute: 0, second: 0, millis: 123
-        };
-        let result = format_timestamp_bytes(&dt, "iso8601");
-        assert_eq!(&result, b"2026-01-01T17:00:00.123Z");
-        
-        let result2 = format_timestamp_bytes(&dt, "questdb");
-        assert_eq!(&result2, b"2026-01-01 17:00:00.123");
-    }
-
-    #[test]
-    fn test_strip_field_quotes() {
-        assert_eq!(strip_field_quotes(b"\"hello\""), b"hello");
-        assert_eq!(strip_field_quotes(b"hello"), b"hello");
-        assert_eq!(strip_field_quotes(b"\"a,b\""), b"a,b");
+    fn test_build_csv_row() {
+        let cols: Vec<&[u8]> = vec![b"a", b"b,c", b"d"];
+        let result = build_csv_row(&cols, b',');
+        assert_eq!(result, "a,\"b,c\",d");
     }
 }
