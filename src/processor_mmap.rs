@@ -83,7 +83,7 @@ pub fn process_file(args: &Args) -> Result<()> {
             .enumerate()
             .filter(|(idx, _)| *idx >= local_skip)
             .map(|(_, line)| {
-                process_line_to_string(line, delimiter, args.date_col, args.time_col, args.combine_datetime, &args.timestamp_format)
+                process_line_to_string(line, delimiter, args.date_col, args.time_col, args.combine_datetime, &args.timestamp_format, &args.symbol, &args.mic)
             })
             .collect();
 
@@ -145,74 +145,91 @@ fn process_line_to_string(
     time_col: usize,
     combine_datetime: bool,
     timestamp_format: &str,
+    symbol: &str,
+    mic: &str,
 ) -> String {
     // Parse fields from line, respecting quoted fields
     let cols = find_columns_with_quotes(line, delimiter);
     
+    // Build output: symbol, mic, then rest
+    let mut result = String::with_capacity(line.len() + 20);
+    
+    // Add symbol and mic as first two columns
+    extend_with_csv_field_string(&mut result, symbol.as_bytes(), delimiter);
+    result.push(delimiter as char);
+    extend_with_csv_field_string(&mut result, mic.as_bytes(), delimiter);
+    
     if !combine_datetime {
-        // No transformation - return as CSV with proper quoting
-        return build_csv_row(&cols, delimiter);
+        // No transformation - append all columns as CSV
+        for col in cols.iter() {
+            result.push(delimiter as char);
+            extend_with_csv_field_string(&mut result, col, delimiter);
+        }
+        return result;
     }
     
-    if date_col >= cols.len() || time_col >= cols.len() {
-        return build_csv_row(&cols, delimiter);
-    }
+    if date_col < cols.len() {
+        result.push(delimiter as char);
+        if time_col < cols.len() {
+            let date = cols[date_col];
+            let time = cols[time_col];
 
-    let date = cols[date_col];
-    let time = cols[time_col];
-
-    // Parse datetime
-    let timestamp = parse_datetime(date, time);
-    
-    if let Some(ts) = timestamp {
-        let formatted = format_timestamp(&ts, timestamp_format);
-        
-        // Build result: timestamp + remaining columns (skipping time_col)
-        let mut result = Vec::with_capacity(line.len());
-        for (i, col) in cols.iter().enumerate() {
-            if i == date_col {
-                // Add timestamp (may need quoting if it contains delimiter)
-                extend_with_csv_field(&mut result, formatted.as_bytes(), delimiter);
-            } else if i != time_col {
-                result.push(delimiter);
-                extend_with_csv_field(&mut result, col, delimiter);
+            // Parse datetime
+            let timestamp = parse_datetime(date, time);
+            
+            if let Some(ts) = timestamp {
+                let formatted = format_timestamp(&ts, timestamp_format);
+                extend_with_csv_field_string(&mut result, formatted.as_bytes(), delimiter);
+            } else {
+                extend_with_csv_field_string(&mut result, date, delimiter);
+            }
+            
+            // Add remaining columns (skip date and time)
+            for (i, col) in cols.iter().enumerate() {
+                if i != date_col && i != time_col {
+                    result.push(delimiter as char);
+                    extend_with_csv_field_string(&mut result, col, delimiter);
+                }
+            }
+        } else {
+            // No time column - just add date
+            extend_with_csv_field_string(&mut result, cols[date_col], delimiter);
+            // Add remaining columns except date
+            for (i, col) in cols.iter().enumerate() {
+                if i != date_col {
+                    result.push(delimiter as char);
+                    extend_with_csv_field_string(&mut result, col, delimiter);
+                }
             }
         }
-        return String::from_utf8_lossy(&result).into_owned();
-    }
-
-    build_csv_row(&cols, delimiter)
-}
-
-/// Build a properly quoted CSV row from fields
-fn build_csv_row(cols: &[&[u8]], delimiter: u8) -> String {
-    let mut result = Vec::with_capacity(cols.len() * 20);
-    for (i, col) in cols.iter().enumerate() {
-        if i > 0 {
-            result.push(delimiter);
+    } else {
+        // No date column - just add remaining columns
+        for col in cols.iter() {
+            result.push(delimiter as char);
+            extend_with_csv_field_string(&mut result, col, delimiter);
         }
-        extend_with_csv_field(&mut result, col, delimiter);
     }
-    String::from_utf8_lossy(&result).into_owned()
+    
+    result
 }
 
-/// Extend buffer with a CSV field, adding quotes and escaping if needed
-fn extend_with_csv_field(buf: &mut Vec<u8>, field: &[u8], delimiter: u8) {
+/// Extend String with a CSV field, adding quotes and escaping if needed
+fn extend_with_csv_field_string(buf: &mut String, field: &[u8], delimiter: u8) {
     let needs_quotes = field.iter().any(|&b| b == b'"' || b == b'\n' || b == b'\r' || b == delimiter);
     
     if needs_quotes {
-        buf.push(b'"');
+        buf.push('"');
         for &byte in field {
             if byte == b'"' {
-                buf.push(b'"');
-                buf.push(b'"');
+                buf.push('"');
+                buf.push('"');
             } else {
-                buf.push(byte);
+                buf.push(byte as char);
             }
         }
-        buf.push(b'"');
+        buf.push('"');
     } else {
-        buf.extend_from_slice(field);
+        buf.push_str(std::str::from_utf8(field).unwrap_or(""));
     }
 }
 
@@ -449,15 +466,19 @@ mod tests {
     #[test]
     fn test_process_line_to_string() {
         let line = b"1/1/2026,17:00:00.000,6902.00,4";
-        let result = process_line_to_string(line, b',', 0, 1, true, "iso8601");
-        assert!(result.starts_with("2026-01-01T"));
-        assert!(result.contains(",6902.00,"));
+        let result = process_line_to_string(line, b',', 0, 1, true, "iso8601", "ES", "XCME");
+        // Output format: symbol, mic, timestamp, price, size
+        assert!(result.starts_with("ES,XCME,2026-01-01T"));
+        assert!(result.ends_with("6902.00,4"));
     }
 
     #[test]
-    fn test_build_csv_row() {
-        let cols: Vec<&[u8]> = vec![b"a", b"b,c", b"d"];
-        let result = build_csv_row(&cols, b',');
-        assert_eq!(result, "a,\"b,c\",d");
+    fn test_symbol_mic_columns() {
+        let line = b"1/1/2026,17:00:00.000,6902.00,4";
+        let result = process_line_to_string(line, b',', 0, 1, true, "questdb", "CL", "XNYS");
+        let parts: Vec<&str> = result.split(',').collect();
+        assert_eq!(parts.len(), 5);
+        assert_eq!(parts[0], "CL");  // symbol
+        assert_eq!(parts[1], "XNYS"); // mic
     }
 }

@@ -20,10 +20,16 @@ fn process_batch(
     time_col: usize,
     combine_datetime: bool,
     timestamp_format: &str,
+    symbol: &str,
+    mic: &str,
 ) -> Vec<Vec<String>> {
     batch
         .into_par_iter()
-        .map(|mut cols| {
+        .map(|cols| {
+            let mut output = Vec::with_capacity(cols.len() + 2);
+            output.push(symbol.to_string());
+            output.push(mic.to_string());
+
             if combine_datetime && date_col < cols.len() && time_col < cols.len() {
                 let date = &cols[date_col];
                 let time = &cols[time_col];
@@ -32,12 +38,22 @@ fn process_batch(
                 let timestamp = Transformer::parse_datetime(date, time);
                 if let Some(ts) = timestamp {
                     let formatted = Transformer::format_timestamp(&ts, timestamp_format);
-                    // Replace date column with formatted timestamp, remove time column
-                    cols[date_col] = formatted;
-                    cols.remove(time_col);
+                    output.push(formatted);
+                } else {
+                    output.push(cols[date_col].clone());
                 }
+                // Add remaining columns except date and time
+                for (i, col) in cols.iter().enumerate() {
+                    if i != date_col && i != time_col {
+                        output.push(col.clone());
+                    }
+                }
+            } else {
+                // No datetime transformation - add all columns as-is
+                output.extend(cols);
             }
-            cols
+
+            output
         })
         .collect()
 }
@@ -133,6 +149,8 @@ pub fn process_file(args: &Args) -> Result<()> {
                         args.time_col,
                         args.combine_datetime,
                         &args.timestamp_format,
+                        &args.symbol,
+                        &args.mic,
                     );
 
                     let written = write_batch(&mut writer, results);
@@ -157,6 +175,8 @@ pub fn process_file(args: &Args) -> Result<()> {
             args.time_col,
             args.combine_datetime,
             &args.timestamp_format,
+            &args.symbol,
+            &args.mic,
         );
 
         let written = write_batch(&mut writer, results);
