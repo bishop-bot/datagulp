@@ -2,6 +2,7 @@
 
 use crate::stats::Stats;
 use anyhow::{Context, Result};
+use csv::WriterBuilder;
 use memmap2::Mmap;
 use rayon::prelude::*;
 use std::fs::File;
@@ -18,9 +19,10 @@ pub fn process_file(args: &Args) -> Result<()> {
     let input_file = File::open(&args.input)
         .with_context(|| format!("Failed to open input file: {}", args.input.display()))?;
 
+    let delimiter = args.delimiter.as_bytes().first().copied().unwrap_or(b',');
     let output_path = args.output.clone().unwrap_or_else(|| PathBuf::from("-"));
 
-    let mut output_file: Box<dyn Write> = if output_path.as_os_str() == "-" {
+    let output_file: Box<dyn Write> = if output_path.as_os_str() == "-" {
         Box::new(std::io::stdout())
     } else {
         Box::new(BufWriter::new(File::create(&output_path)?))
@@ -47,6 +49,11 @@ pub fn process_file(args: &Args) -> Result<()> {
             cancelled_clone.store(true, Ordering::SeqCst);
         }));
     }
+
+    // Create CSV writer
+    let mut writer = WriterBuilder::new()
+        .delimiter(delimiter)
+        .from_writer(output_file);
 
     // Process in large chunks
     let chunk_size = args.batch_size.max(100_000);
@@ -77,22 +84,22 @@ pub fn process_file(args: &Args) -> Result<()> {
         let lines = split_lines_fast(chunk);
 
         // Process in parallel using Rayon
-        let processed: Vec<String> = lines
+        let processed: Vec<Vec<String>> = lines
             .par_iter()
             .enumerate()
             .filter(|(idx, _)| *idx >= local_skip)
             .map(|(_, line)| {
-                process_line_raw(line, args.date_col, args.time_col, args.combine_datetime, &args.timestamp_format)
+                process_line_to_fields(line, args.date_col, args.time_col, args.combine_datetime, &args.timestamp_format)
             })
             .collect();
 
         let count = processed.len();
         stats.inc_read(count);
 
-        // Write to output
+        // Write to CSV output
         if !processed.is_empty() {
-            for line in processed {
-                writeln!(output_file, "{}", line).ok();
+            for fields in processed {
+                writer.write_record(&fields).ok();
             }
             stats.inc_written(count);
         }
@@ -104,7 +111,7 @@ pub fn process_file(args: &Args) -> Result<()> {
         }
     }
 
-    output_file.flush()?;
+    writer.flush()?;
     stats.finish();
     stats.print_summary();
 
@@ -132,66 +139,80 @@ fn split_lines_fast(data: &[u8]) -> Vec<&[u8]> {
     lines
 }
 
-/// Process a raw line
-fn process_line_raw(
+/// Process a raw line and return fields
+fn process_line_to_fields(
     line: &[u8],
     date_col: usize,
     time_col: usize,
     combine_datetime: bool,
     timestamp_format: &str,
-) -> String {
-    if !combine_datetime {
-        return String::from_utf8_lossy(line).into_owned();
-    }
-
+) -> Vec<String> {
+    // Parse fields from line
     let cols = find_columns(line, b',');
-    if date_col >= cols.len() || time_col >= cols.len() {
-        return String::from_utf8_lossy(line).into_owned();
-    }
+    
+    // Convert to owned Strings
+    let mut fields: Vec<String> = cols.iter()
+        .map(|c| strip_quotes(String::from_utf8_lossy(c)))
+        .collect();
 
-    let date = cols[date_col];
-    let time = cols[time_col];
+    if combine_datetime && date_col < fields.len() && time_col < fields.len() {
+        let date = &fields[date_col];
+        let time = &fields[time_col];
 
-    let date_str = String::from_utf8_lossy(date);
-    let time_str = String::from_utf8_lossy(time);
-
-    let timestamp = parse_datetime(&date_str, &time_str);
-    if let Some(ts) = timestamp {
-        let formatted = format_timestamp(&ts, timestamp_format);
-
-        let mut result = Vec::with_capacity(line.len());
-        for (i, col) in cols.iter().enumerate() {
-            if i == date_col {
-                result.extend_from_slice(formatted.as_bytes());
-            } else if i != time_col {
-                result.extend_from_slice(col);
-                result.push(b',');
-            }
+        let timestamp = parse_datetime(date, time);
+        if let Some(ts) = timestamp {
+            let formatted = format_timestamp(&ts, timestamp_format);
+            fields[date_col] = formatted;
+            fields.remove(time_col);
         }
-        if let Some(b',') = result.pop() {}
-
-        return String::from_utf8_lossy(&result).into_owned();
     }
 
-    String::from_utf8_lossy(line).into_owned()
+    fields
 }
 
-/// Find column boundaries
+/// Strip surrounding quotes from a string
+fn strip_quotes(s: std::borrow::Cow<str>) -> String {
+    let s = s.trim();
+    if s.starts_with('"') && s.ends_with('"') {
+        s[1..s.len()-1].to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+/// Find column boundaries, respecting quoted fields
 fn find_columns(line: &[u8], delimiter: u8) -> Vec<&[u8]> {
     let mut cols = Vec::new();
     let mut start = 0;
+    let mut in_quotes = false;
 
     for i in 0..line.len() {
-        if line[i] == delimiter {
-            if i > start {
-                cols.push(&line[start..i]);
+        let byte = line[i];
+        match byte {
+            b'"' => {
+                in_quotes = !in_quotes;
             }
-            start = i + 1;
+            c if !in_quotes && c == delimiter => {
+                if i > start {
+                    cols.push(&line[start..i]);
+                }
+                start = i + 1;
+            }
+            _ => {}
         }
     }
 
-    if start <= line.len() {
-        cols.push(&line[start..line.len()]);
+    // Handle last field (without trailing newline)
+    let line_len = line.len();
+    // Trim trailing newline if present
+    let end = if line_len > 0 && line[line_len - 1] == b'\n' {
+        line_len - 1
+    } else {
+        line_len
+    };
+
+    if start < end {
+        cols.push(&line[start..end]);
     }
 
     cols
@@ -314,6 +335,16 @@ mod tests {
     }
 
     #[test]
+    fn test_find_columns_with_quotes() {
+        let line = b"a,\"b,c\",d";
+        let cols = find_columns(line, b',');
+        assert_eq!(cols.len(), 3);
+        assert_eq!(cols[0], b"a");
+        assert_eq!(cols[1], b"\"b,c\"");
+        assert_eq!(cols[2], b"d");
+    }
+
+    #[test]
     fn test_parse_datetime_mdy() {
         let result = parse_datetime("1/15/2026", "14:30:45.123");
         assert!(result.is_some());
@@ -335,5 +366,15 @@ mod tests {
         assert_eq!(dt.month, 1);
         assert_eq!(dt.day, 15);
         assert_eq!(dt.year, 2026);
+    }
+
+    #[test]
+    fn test_process_line_to_fields() {
+        let line = b"1/1/2026,17:00:00.000,6902.00,4";
+        let result = process_line_to_fields(line, 0, 1, true, "iso8601");
+        assert_eq!(result.len(), 3);
+        assert!(result[0].starts_with("2026-01-01T"));
+        assert_eq!(result[1], "6902.00");
+        assert_eq!(result[2], "4");
     }
 }
